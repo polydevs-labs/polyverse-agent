@@ -11,6 +11,6 @@ pub use dispatch::{McpDispatcher, ToolCallExecutor, ToolCallFailure, ToolCallFai
 pub use provider::{
     default_providers, ExecutionToolProvider, RegisteredTool, SearchProviderConfig,
     SearchToolProvider, SocialToolProvider, ToolProvider, WebFetchProviderConfig,
-    WebFetchToolProvider,
+    WebFetchToolProvider, WebRetrieveFastProviderConfig, WebRetrieveFastToolProvider,
 };
 pub use server::{build_mcp_router, build_mcp_router_for_tests, McpWorker};

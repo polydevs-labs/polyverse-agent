@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,12 +10,14 @@ use memory::graph::CognitiveGraph;
 use reqwest::{redirect::Policy, Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::{sync::Mutex, task::JoinSet};
 use url::Url;
 
 use crate::registry::{ToolDescriptor, ToolNamespace};
 
 const SEARCH_WEB_TOOL: &str = "search.web";
 const WEB_FETCH_TOOL: &str = "web.fetch";
+const WEB_RETRIEVE_FAST_TOOL: &str = "web.retrieve_fast";
 const BRAVE_SEARCH_API_BASE_DEFAULT: &str = "https://api.search.brave.com/res/v1/web/search";
 
 const WEB_FETCH_TIMEOUT_MS_DEFAULT: u64 = 2_000;
@@ -50,6 +52,603 @@ const WEB_FETCH_BLOCKED_HOSTS: [&str; 7] = [
     "100.100.100.200",
 ];
 const WEB_FETCH_USER_AGENT: &str = "polyverse-agent-mcp/0.1";
+
+const WEB_FAST_TOTAL_BUDGET_MS_DEFAULT: u64 = 1_200;
+const WEB_FAST_SEARCH_TIMEOUT_MS_DEFAULT: u64 = 600;
+const WEB_FAST_FETCH_TIMEOUT_MS_DEFAULT: u64 = 400;
+const WEB_FAST_FETCH_K_DEFAULT: usize = 2;
+const WEB_FAST_MAX_CHARS_PER_PAGE_DEFAULT: usize = 1_200;
+const WEB_FAST_CACHE_TTL_MS_DEFAULT: u64 = 30_000;
+const WEB_FAST_CACHE_MAX_ENTRIES_DEFAULT: usize = 128;
+
+const WEB_FAST_TOTAL_BUDGET_MS_FLOOR: u64 = 200;
+const WEB_FAST_TOTAL_BUDGET_MS_CEILING: u64 = 20_000;
+const WEB_FAST_SEARCH_TIMEOUT_MS_FLOOR: u64 = 100;
+const WEB_FAST_SEARCH_TIMEOUT_MS_CEILING: u64 = 5_000;
+const WEB_FAST_FETCH_TIMEOUT_MS_FLOOR: u64 = 100;
+const WEB_FAST_FETCH_TIMEOUT_MS_CEILING: u64 = 3_000;
+const WEB_FAST_FETCH_K_CEILING: usize = 5;
+const WEB_FAST_MAX_CHARS_PER_PAGE_FLOOR: usize = 256;
+const WEB_FAST_MAX_CHARS_PER_PAGE_CEILING: usize = 8_000;
+const WEB_FAST_CACHE_TTL_MS_CEILING: u64 = 300_000;
+const WEB_FAST_CACHE_MAX_ENTRIES_CEILING: usize = 1_024;
+const WEB_FAST_FETCH_MAX_REDIRECTS: usize = 2;
+const WEB_FAST_FETCH_MAX_BYTES: u64 = 512_000;
+const WEB_FAST_SEARCH_TOP_K: usize = 8;
+
+#[derive(Debug, Clone)]
+struct FastCacheEntry {
+    expires_at: Instant,
+    value: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebRetrieveFastProviderConfig {
+    pub enabled: bool,
+    pub total_budget_ms: u64,
+    pub search_timeout_ms: u64,
+    pub fetch_timeout_ms: u64,
+    pub fetch_k_default: usize,
+    pub max_chars_per_page_default: usize,
+    pub cache_ttl_ms: u64,
+    pub cache_max_entries: usize,
+}
+
+#[derive(Debug)]
+pub struct WebRetrieveFastToolProvider {
+    config: WebRetrieveFastProviderConfig,
+    search_config: SearchProviderConfig,
+    client: Client,
+    tools: Vec<RegisteredTool>,
+    cache: Mutex<BTreeMap<String, FastCacheEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct WebFastEvidence {
+    url: String,
+    final_url: String,
+    title: Option<String>,
+    snippet: String,
+    status: u16,
+    content_type: String,
+    response_ms: u64,
+    truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebRetrieveFastInput {
+    query: String,
+    #[serde(default)]
+    safesearch: Option<String>,
+    #[serde(default)]
+    fetch_k: Option<usize>,
+    #[serde(default)]
+    max_chars_per_page: Option<usize>,
+}
+
+fn remaining_budget_ms(started: Instant, total_budget_ms: u64) -> u64 {
+    total_budget_ms.saturating_sub(started.elapsed().as_millis() as u64)
+}
+
+fn cache_key_for_web_fast(query: &str, safesearch: &str, fetch_k: usize, max_chars_per_page: usize) -> String {
+    format!("{}\u{1f}|{}\u{1f}|{}\u{1f}|{}", query, safesearch, fetch_k, max_chars_per_page)
+}
+
+fn trim_cache_to_max_entries(cache: &mut BTreeMap<String, FastCacheEntry>, max_entries: usize) {
+    while cache.len() > max_entries {
+        if let Some(first_key) = cache.keys().next().cloned() {
+            cache.remove(&first_key);
+        } else {
+            break;
+        }
+    }
+}
+
+fn with_fast_meta_overrides(
+    mut value: Value,
+    response_ms: u64,
+    cache_hit: bool,
+    partial: bool,
+    degraded_reason: Option<&str>,
+) -> Value {
+    if let Some(meta) = value.get_mut("meta").and_then(|v| v.as_object_mut()) {
+        meta.insert("response_ms".to_string(), json!(response_ms));
+        meta.insert("cache_hit".to_string(), json!(cache_hit));
+        meta.insert("partial".to_string(), json!(partial));
+        meta.insert("degraded_reason".to_string(), json!(degraded_reason));
+    }
+    value
+}
+
+fn make_web_fast_degraded_response(
+    query: &str,
+    results: Vec<Value>,
+    evidence: Vec<Value>,
+    citations: Vec<Value>,
+    search_ms: u64,
+    fetch_ms: u64,
+    response_ms: u64,
+    budget_ms: u64,
+    fetch_attempted: usize,
+    fetch_succeeded: usize,
+    cache_hit: bool,
+    degraded_reason: Option<&str>,
+) -> Value {
+    json!({
+        "query": query,
+        "results": results,
+        "evidence": evidence,
+        "citations": citations,
+        "meta": {
+            "source": "web_retrieve_fast",
+            "response_ms": response_ms,
+            "search_ms": search_ms,
+            "fetch_ms": fetch_ms,
+            "partial": degraded_reason.is_some() || fetch_succeeded < fetch_attempted,
+            "degraded_reason": degraded_reason,
+            "cache_hit": cache_hit,
+            "budget_ms": budget_ms,
+            "fetch_attempted": fetch_attempted,
+            "fetch_succeeded": fetch_succeeded
+        }
+    })
+}
+
+async fn fetch_web_fast_evidence(
+    client: Client,
+    source_url: String,
+    timeout_ms: u64,
+    max_chars_per_page: usize,
+) -> anyhow::Result<WebFastEvidence> {
+    let mut current_url = parse_and_validate_web_url(&source_url)?;
+    let started = Instant::now();
+    let mut redirects = 0usize;
+
+    loop {
+        validate_public_url(&current_url)?;
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(timeout_ms.max(1)),
+            client
+                .get(current_url.clone())
+                .header(
+                    reqwest::header::ACCEPT,
+                    "text/html,text/plain,application/xhtml+xml;q=0.9,*/*;q=0.1",
+                )
+                .send(),
+        )
+        .await
+        .map_err(|_| anyhow!("web fast fetch timeout"))??;
+
+        if response.status().is_redirection() {
+            if redirects >= WEB_FAST_FETCH_MAX_REDIRECTS {
+                bail!("too many redirects");
+            }
+            let next = redirect_target(&current_url, response.status(), response.headers())?;
+            validate_public_url(&next).context("redirect target is not allowed")?;
+            current_url = next;
+            redirects += 1;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            bail!("web fast fetch returned non-success status: {}", response.status());
+        }
+
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        ensure_allowed_content_type(&content_type)?;
+
+        let bytes = read_bounded_body(response, WEB_FAST_FETCH_MAX_BYTES).await?;
+        let raw = String::from_utf8_lossy(&bytes).to_string();
+
+        let (title, mut content) = if is_html_content_type(&content_type) {
+            (extract_html_title(&raw), normalize_html_to_text(&raw))
+        } else {
+            (None, normalize_plain_text(&raw))
+        };
+
+        let before_chars = content.chars().count();
+        let truncated = before_chars > max_chars_per_page;
+        if truncated {
+            content = truncate_chars(&content, max_chars_per_page);
+        }
+
+        return Ok(WebFastEvidence {
+            url: source_url,
+            final_url: current_url.to_string(),
+            title,
+            snippet: content,
+            status: status.as_u16(),
+            content_type,
+            response_ms: started.elapsed().as_millis() as u64,
+            truncated,
+        });
+    }
+}
+
+fn web_retrieve_fast_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": { "type": "string", "description": "Search query string." },
+            "safesearch": { "type": "string", "enum": ["off", "moderate", "strict"] },
+            "fetch_k": { "type": "integer", "minimum": 1, "maximum": WEB_FAST_FETCH_K_CEILING },
+            "max_chars_per_page": {
+                "type": "integer",
+                "minimum": WEB_FAST_MAX_CHARS_PER_PAGE_FLOOR,
+                "maximum": WEB_FAST_MAX_CHARS_PER_PAGE_CEILING
+            }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+    })
+}
+
+impl Default for WebRetrieveFastProviderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: parse_env_bool("MCP_WEB_RETRIEVE_FAST_ENABLED", false),
+            total_budget_ms: parse_env_u64("MCP_WEB_FAST_TOTAL_BUDGET_MS", WEB_FAST_TOTAL_BUDGET_MS_DEFAULT)
+                .clamp(WEB_FAST_TOTAL_BUDGET_MS_FLOOR, WEB_FAST_TOTAL_BUDGET_MS_CEILING),
+            search_timeout_ms: parse_env_u64("MCP_WEB_FAST_SEARCH_TIMEOUT_MS", WEB_FAST_SEARCH_TIMEOUT_MS_DEFAULT)
+                .clamp(WEB_FAST_SEARCH_TIMEOUT_MS_FLOOR, WEB_FAST_SEARCH_TIMEOUT_MS_CEILING),
+            fetch_timeout_ms: parse_env_u64("MCP_WEB_FAST_FETCH_TIMEOUT_MS", WEB_FAST_FETCH_TIMEOUT_MS_DEFAULT)
+                .clamp(WEB_FAST_FETCH_TIMEOUT_MS_FLOOR, WEB_FAST_FETCH_TIMEOUT_MS_CEILING),
+            fetch_k_default: parse_env_usize("MCP_WEB_FAST_FETCH_K_DEFAULT", WEB_FAST_FETCH_K_DEFAULT)
+                .clamp(1, WEB_FAST_FETCH_K_CEILING),
+            max_chars_per_page_default: parse_env_usize(
+                "MCP_WEB_FAST_MAX_CHARS_PER_PAGE_DEFAULT",
+                WEB_FAST_MAX_CHARS_PER_PAGE_DEFAULT,
+            )
+            .clamp(
+                WEB_FAST_MAX_CHARS_PER_PAGE_FLOOR,
+                WEB_FAST_MAX_CHARS_PER_PAGE_CEILING,
+            ),
+            cache_ttl_ms: parse_env_u64("MCP_WEB_FAST_CACHE_TTL_MS", WEB_FAST_CACHE_TTL_MS_DEFAULT)
+                .clamp(0, WEB_FAST_CACHE_TTL_MS_CEILING),
+            cache_max_entries: parse_env_usize(
+                "MCP_WEB_FAST_CACHE_MAX_ENTRIES",
+                WEB_FAST_CACHE_MAX_ENTRIES_DEFAULT,
+            )
+            .clamp(1, WEB_FAST_CACHE_MAX_ENTRIES_CEILING),
+        }
+    }
+}
+
+impl WebRetrieveFastProviderConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn effective_fetch_k(&self, requested: Option<usize>) -> usize {
+        requested.unwrap_or(self.fetch_k_default).clamp(1, self.fetch_k_default)
+    }
+
+    fn effective_max_chars_per_page(&self, requested: Option<usize>) -> usize {
+        requested
+            .unwrap_or(self.max_chars_per_page_default)
+            .clamp(WEB_FAST_MAX_CHARS_PER_PAGE_FLOOR, self.max_chars_per_page_default)
+    }
+}
+
+impl Default for WebRetrieveFastToolProvider {
+    fn default() -> Self {
+        Self::new(WebRetrieveFastProviderConfig::default(), SearchProviderConfig::default())
+    }
+}
+
+impl WebRetrieveFastToolProvider {
+    pub fn new(config: WebRetrieveFastProviderConfig, search_config: SearchProviderConfig) -> Self {
+        let timeout = Duration::from_millis(config.total_budget_ms.max(100));
+        let client = Client::builder()
+            .timeout(timeout)
+            .redirect(Policy::none())
+            .user_agent(WEB_FETCH_USER_AGENT)
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
+        let tools = if config.is_enabled() {
+            vec![RegisteredTool {
+                descriptor: ToolDescriptor {
+                    namespace: ToolNamespace::Read,
+                    name: WEB_RETRIEVE_FAST_TOOL,
+                    read_only: true,
+                },
+                description: "Fast single-call web retrieval: search + bounded evidence fetch with strict latency budget.",
+                input_schema: web_retrieve_fast_input_schema(),
+            }]
+        } else {
+            Vec::new()
+        };
+
+        Self {
+            config,
+            search_config,
+            client,
+            tools,
+            cache: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.config.is_enabled()
+    }
+
+    async fn execute_retrieve_fast(&self, input: Value) -> anyhow::Result<Value> {
+        if !self.is_enabled() {
+            bail!("web retrieve fast tools are disabled");
+        }
+
+        let input: WebRetrieveFastInput = serde_json::from_value(input)?;
+        let query = input.query.trim().to_string();
+        if query.is_empty() {
+            bail!("query is required");
+        }
+
+        let safesearch = normalize_safesearch(input.safesearch)?;
+        let fetch_k = self.config.effective_fetch_k(input.fetch_k);
+        let max_chars_per_page = self.config.effective_max_chars_per_page(input.max_chars_per_page);
+
+        let cache_key = cache_key_for_web_fast(&query, &safesearch, fetch_k, max_chars_per_page);
+        let started = Instant::now();
+
+        if self.config.cache_ttl_ms > 0 {
+            let mut cache = self.cache.lock().await;
+            cache.retain(|_, entry| entry.expires_at > Instant::now());
+            if let Some(entry) = cache.get(&cache_key) {
+                return Ok(with_fast_meta_overrides(
+                    entry.value.clone(),
+                    started.elapsed().as_millis() as u64,
+                    true,
+                    entry
+                        .value
+                        .get("meta")
+                        .and_then(|m| m.get("partial"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    entry
+                        .value
+                        .get("meta")
+                        .and_then(|m| m.get("degraded_reason"))
+                        .and_then(|v| v.as_str()),
+                ));
+            }
+        }
+
+        let api_key = self
+            .search_config
+            .api_key
+            .as_deref()
+            .ok_or_else(|| anyhow!("missing BRAVE_SEARCH_API_KEY"))?;
+
+        let search_started = Instant::now();
+        let search_remaining = remaining_budget_ms(started, self.config.total_budget_ms);
+        if search_remaining == 0 {
+            let out = make_web_fast_degraded_response(
+                &query,
+                vec![],
+                vec![],
+                vec![],
+                0,
+                0,
+                started.elapsed().as_millis() as u64,
+                self.config.total_budget_ms,
+                0,
+                0,
+                false,
+                Some("budget_exhausted_before_search"),
+            );
+            return Ok(out);
+        }
+
+        let search_timeout_ms = self
+            .config
+            .search_timeout_ms
+            .min(search_remaining)
+            .max(1);
+        let search_count = fetch_k.max(3).min(WEB_FAST_SEARCH_TOP_K);
+
+        let search_response = tokio::time::timeout(
+            Duration::from_millis(search_timeout_ms),
+            self.client
+                .get(&self.search_config.brave_api_base)
+                .header("X-Subscription-Token", api_key)
+                .query(&[
+                    ("q", query.as_str()),
+                    ("count", &search_count.to_string()),
+                    ("offset", "0"),
+                    ("safesearch", safesearch.as_str()),
+                ])
+                .send(),
+        )
+        .await;
+
+        let search_payload: BraveSearchResponse = match search_response {
+            Ok(Ok(resp)) => resp
+                .error_for_status()
+                .map_err(|err| anyhow!("brave search returned error: {err}"))?
+                .json()
+                .await
+                .context("failed to parse brave search response")?,
+            Ok(Err(_)) => {
+                return Ok(make_web_fast_degraded_response(
+                    &query,
+                    vec![],
+                    vec![],
+                    vec![],
+                    search_started.elapsed().as_millis() as u64,
+                    0,
+                    started.elapsed().as_millis() as u64,
+                    self.config.total_budget_ms,
+                    0,
+                    0,
+                    false,
+                    Some("search_failed"),
+                ));
+            }
+            Err(_) => {
+                return Ok(make_web_fast_degraded_response(
+                    &query,
+                    vec![],
+                    vec![],
+                    vec![],
+                    search_started.elapsed().as_millis() as u64,
+                    0,
+                    started.elapsed().as_millis() as u64,
+                    self.config.total_budget_ms,
+                    0,
+                    0,
+                    false,
+                    Some("search_timeout"),
+                ));
+            }
+        };
+
+        let search_ms = search_started.elapsed().as_millis() as u64;
+
+        let mut results = Vec::new();
+        let mut citations = Vec::new();
+        let mut fetch_targets = Vec::new();
+
+        for item in search_payload
+            .web
+            .map(|section| section.results)
+            .unwrap_or_default()
+            .into_iter()
+            .take(search_count)
+        {
+            let snippet = item
+                .description
+                .clone()
+                .or(item.snippet.clone())
+                .or_else(|| item.extra_snippets.clone().and_then(|mut xs| xs.drain(..).next()))
+                .unwrap_or_default();
+
+            results.push(json!({
+                "title": item.title,
+                "url": item.url,
+                "snippet": snippet,
+                "age": item.age,
+            }));
+
+            citations.push(json!({
+                "title": item.title,
+                "url": item.url,
+            }));
+
+            if fetch_targets.len() < fetch_k {
+                fetch_targets.push(item.url);
+            }
+        }
+
+        let fetch_started = Instant::now();
+        let mut join_set = JoinSet::new();
+        for url in fetch_targets.iter().cloned() {
+            join_set.spawn(fetch_web_fast_evidence(
+                self.client.clone(),
+                url,
+                self.config.fetch_timeout_ms,
+                max_chars_per_page,
+            ));
+        }
+
+        let mut evidence = Vec::new();
+        let fetch_attempted = fetch_targets.len();
+        let mut fetch_succeeded = 0usize;
+        let mut degraded_reason: Option<&str> = None;
+
+        while !join_set.is_empty() {
+            if remaining_budget_ms(started, self.config.total_budget_ms) == 0 {
+                join_set.abort_all();
+                degraded_reason = Some("budget_exhausted_during_fetch");
+                break;
+            }
+
+            match join_set.join_next().await {
+                Some(Ok(Ok(item))) => {
+                    fetch_succeeded += 1;
+                    evidence.push(json!({
+                        "url": item.url,
+                        "final_url": item.final_url,
+                        "title": item.title,
+                        "snippet": item.snippet,
+                        "status": item.status,
+                        "content_type": item.content_type,
+                        "response_ms": item.response_ms,
+                        "truncated": item.truncated,
+                    }));
+                }
+                Some(Ok(Err(_))) => {
+                    degraded_reason.get_or_insert("partial_fetch_failed");
+                }
+                Some(Err(_)) => {
+                    degraded_reason.get_or_insert("partial_fetch_failed");
+                }
+                None => break,
+            }
+        }
+
+        let fetch_ms = fetch_started.elapsed().as_millis() as u64;
+        let out = make_web_fast_degraded_response(
+            &query,
+            results,
+            evidence,
+            citations,
+            search_ms,
+            fetch_ms,
+            started.elapsed().as_millis() as u64,
+            self.config.total_budget_ms,
+            fetch_attempted,
+            fetch_succeeded,
+            false,
+            degraded_reason,
+        );
+
+        if self.config.cache_ttl_ms > 0 {
+            let mut cache = self.cache.lock().await;
+            cache.retain(|_, entry| entry.expires_at > Instant::now());
+            cache.insert(
+                cache_key,
+                FastCacheEntry {
+                    expires_at: Instant::now() + Duration::from_millis(self.config.cache_ttl_ms),
+                    value: out.clone(),
+                },
+            );
+            trim_cache_to_max_entries(&mut cache, self.config.cache_max_entries);
+        }
+
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl ToolProvider for WebRetrieveFastToolProvider {
+    fn tools(&self) -> &[RegisteredTool] {
+        &self.tools
+    }
+
+    async fn execute(
+        &self,
+        name: &str,
+        input: Value,
+        _graph: &CognitiveGraph,
+    ) -> Option<anyhow::Result<Value>> {
+        if name != WEB_RETRIEVE_FAST_TOOL {
+            return None;
+        }
+
+        Some(self.execute_retrieve_fast(input).await)
+    }
+}
+
 
 #[derive(Debug, Clone)]
 pub struct RegisteredTool {
@@ -1095,11 +1694,16 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
 }
 
 pub fn default_providers() -> Vec<Arc<dyn ToolProvider>> {
+    let search_config = SearchProviderConfig::default();
     vec![
         Arc::new(SocialToolProvider::default()),
         Arc::new(ExecutionToolProvider::default()),
-        Arc::new(SearchToolProvider::default()),
+        Arc::new(SearchToolProvider::new(search_config.clone())),
         Arc::new(WebFetchToolProvider::default()),
+        Arc::new(WebRetrieveFastToolProvider::new(
+            WebRetrieveFastProviderConfig::default(),
+            search_config,
+        )),
     ]
 }
 

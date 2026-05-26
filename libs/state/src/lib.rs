@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use kernel::event::{Event, Intent, Platform, RawEvent, Sentiment};
+use kernel::event::{Event, Intent, Platform, RawEvent, Sentiment, SystemEvent};
 use kernel::worker::{Worker, WorkerContext, WorkerStatus};
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
@@ -262,7 +262,7 @@ impl StateStore {
             .actor
             .as_deref()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or("cockpit")
+            .unwrap_or("runtime")
             .to_string();
 
         let mut values = self.values.write().await;
@@ -910,6 +910,11 @@ impl Worker for StateDriftWorker {
 
     async fn start(&mut self, ctx: WorkerContext) -> Result<()> {
         self.status = WorkerStatus::Healthy;
+        let _ = ctx
+            .emit(Event::System(SystemEvent::WorkerReady {
+                name: self.name().to_string(),
+            }))
+            .await;
         let mut shutdown_rx = ctx.subscribe_shutdown();
         let mut ticker = tokio::time::interval(self.interval);
 
@@ -944,6 +949,11 @@ impl Worker for StateIntentWorker {
 
     async fn start(&mut self, ctx: WorkerContext) -> Result<()> {
         self.status = WorkerStatus::Healthy;
+        let _ = ctx
+            .emit(Event::System(SystemEvent::WorkerReady {
+                name: self.name().to_string(),
+            }))
+            .await;
         let mut shutdown_rx = ctx.subscribe_shutdown();
         let mut event_rx = ctx.subscribe_events();
 
@@ -1038,6 +1048,11 @@ impl Worker for StateCommandWorker {
 
     async fn start(&mut self, ctx: WorkerContext) -> Result<()> {
         self.status = WorkerStatus::Healthy;
+        let _ = ctx
+            .emit(Event::System(SystemEvent::WorkerReady {
+                name: self.name().to_string(),
+            }))
+            .await;
         let mut shutdown_rx = ctx.subscribe_shutdown();
         let mut event_rx = ctx.subscribe_events();
 
@@ -1112,6 +1127,11 @@ impl Worker for StateUserWorker {
 
     async fn start(&mut self, ctx: WorkerContext) -> Result<()> {
         self.status = WorkerStatus::Healthy;
+        let _ = ctx
+            .emit(Event::System(SystemEvent::WorkerReady {
+                name: self.name().to_string(),
+            }))
+            .await;
         let mut shutdown_rx = ctx.subscribe_shutdown();
         let mut event_rx = ctx.subscribe_events();
 
@@ -1210,6 +1230,11 @@ impl Worker for StateGoalWorker {
 
     async fn start(&mut self, ctx: WorkerContext) -> Result<()> {
         self.status = WorkerStatus::Healthy;
+        let _ = ctx
+            .emit(Event::System(SystemEvent::WorkerReady {
+                name: self.name().to_string(),
+            }))
+            .await;
         let mut shutdown_rx = ctx.subscribe_shutdown();
         let mut event_rx = ctx.subscribe_events();
 
@@ -1294,6 +1319,11 @@ impl Worker for StateEnvironmentWorker {
 
     async fn start(&mut self, ctx: WorkerContext) -> Result<()> {
         self.status = WorkerStatus::Healthy;
+        let _ = ctx
+            .emit(Event::System(SystemEvent::WorkerReady {
+                name: self.name().to_string(),
+            }))
+            .await;
         let mut shutdown_rx = ctx.subscribe_shutdown();
         let mut event_rx = ctx.subscribe_events();
 
@@ -1370,6 +1400,11 @@ impl Worker for StateSystemWorker {
 
     async fn start(&mut self, ctx: WorkerContext) -> Result<()> {
         self.status = WorkerStatus::Healthy;
+        let _ = ctx
+            .emit(Event::System(SystemEvent::WorkerReady {
+                name: self.name().to_string(),
+            }))
+            .await;
         let mut shutdown_rx = ctx.subscribe_shutdown();
         let mut ticker = tokio::time::interval(self.interval);
         let mut system = System::new_all();

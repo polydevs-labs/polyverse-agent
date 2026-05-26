@@ -117,13 +117,6 @@ client.on('ready', async () => {
 });
 
 client.on('messageCreate', async (msg) => {
-    const isAllowedChannel = msg.channelId === '1410283966992351363';
-    const isAllowedDm = !msg.guildId && msg.author.id === '1320303839701897230';
-
-    if (!isAllowedChannel && !isAllowedDm) {
-        return;
-    }
-
     if (msg.author.id === client.user.id) {
         return;
     }

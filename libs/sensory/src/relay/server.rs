@@ -49,6 +49,11 @@ impl Worker for PlatformRelayWorker {
         info!(socket = %self.socket_path, "Platform relay UDS server listening");
 
         self.status = WorkerStatus::Healthy;
+        let _ = ctx
+            .emit(Event::System(kernel::event::SystemEvent::WorkerReady {
+                name: self.name().to_string(),
+            }))
+            .await;
 
         let event_tx = ctx.event_tx.clone();
         let broadcast_tx = ctx.broadcast_rx.clone();

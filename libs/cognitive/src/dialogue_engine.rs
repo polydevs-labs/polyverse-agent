@@ -484,6 +484,7 @@ fn build_tool_planning_messages(
     candidate_users: &[String],
     user_name: String,
     user_content: String,
+    attachments: &[kernel::event::ImageAttachment],
 ) -> Vec<Value> {
     let mut messages = Vec::with_capacity(bundle.messages.len() + 2);
     messages.push(make_system_message(format!(
@@ -494,7 +495,11 @@ fn build_tool_planning_messages(
     for message in &bundle.messages {
         messages.push(message_to_value(message.clone()));
     }
-    messages.push(make_user_message(Some(user_name), user_content));
+    messages.push(make_user_message_with_attachments(
+        Some(user_name),
+        user_content,
+        attachments,
+    ));
     messages
 }
 
@@ -775,24 +780,27 @@ impl DialogueEngineWorker {
         }
     }
 
-    async fn validate_connection(&self) -> Result<()> {
-        let url = format!(
-            "{}/models",
-            self.config.api_base.trim_end_matches('/')
-        );
+    pub async fn validate_api_connection(config: &DialogueEngineConfig) -> Result<()> {
+        let timeout_secs = config.api_timeout_secs.unwrap_or(15);
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
 
-        let response = self
-            .http_client
+        let url = format!("{}/models", config.api_base.trim_end_matches('/'));
+
+        let response = http_client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header("Authorization", format!("Bearer {}", config.api_key))
             .send()
             .await
             .context("Failed to connect to dialogue engine API")?;
 
         if response.status().is_success() {
             info!(
-                api_base = %self.config.api_base,
-                model = %self.config.model,
+                api_base = %config.api_base,
+                model = %config.model,
                 "Dialogue engine API connection validated"
             );
             Ok(())
@@ -801,11 +809,15 @@ impl DialogueEngineWorker {
         } else {
             warn!(
                 status = %response.status(),
-                api_base = %self.config.api_base,
+                api_base = %config.api_base,
                 "Dialogue engine API /models endpoint returned error (API may still work for chat)"
             );
             Ok(())
         }
+    }
+
+    async fn validate_connection(&self) -> Result<()> {
+        Self::validate_api_connection(&self.config).await
     }
 }
 
@@ -1032,6 +1044,11 @@ impl Worker for DialogueEngineWorker {
         }
 
         self.status = WorkerStatus::Healthy;
+        let _ = ctx
+            .emit(Event::System(kernel::event::SystemEvent::WorkerReady {
+                name: self.name().to_string(),
+            }))
+            .await;
         info!("Dialogue engine worker ready");
 
         let mut broadcast_rx = ctx.subscribe_events();
@@ -1466,6 +1483,7 @@ environment: load/noise/time_pressure higher = more friction; channel_quality hi
                     &candidate_users,
                     current_username.to_string(),
                     clean_content.clone(),
+                    &raw_event.attachments,
                 );
 
                 let tool_loop_result = match graph.as_ref() {
@@ -1789,13 +1807,17 @@ mod tests {
         }
     }
 
-    fn test_planning_messages(candidate_users: &[String]) -> Vec<Value> {
+    fn test_planning_messages(
+        candidate_users: &[String],
+        attachments: &[kernel::event::ImageAttachment],
+    ) -> Vec<Value> {
         let bundle = test_prompt_bundle();
         build_tool_planning_messages(
             &bundle,
             candidate_users,
             "alice".to_string(),
             "hello".to_string(),
+            attachments,
         )
     }
 
@@ -1912,7 +1934,7 @@ mod tests {
             &http_client,
             &config,
             &graph,
-            test_planning_messages(candidate_users),
+            test_planning_messages(candidate_users, &[]),
             candidate_users,
             0.0,
         )
@@ -1936,7 +1958,7 @@ mod tests {
             &http_client,
             &config,
             &graph,
-            test_planning_messages(candidate_users),
+            test_planning_messages(candidate_users, &[]),
             candidate_users,
             0.0,
         )
@@ -1953,7 +1975,7 @@ mod tests {
             &http_client,
             &config,
             &graph,
-            test_planning_messages(&["alice".to_string()]),
+            test_planning_messages(&["alice".to_string()], &[]),
             &["alice".to_string()],
             0.0,
         )
@@ -1972,7 +1994,7 @@ mod tests {
             &http_client,
             &config,
             &graph,
-            test_planning_messages(&["alice".to_string()]),
+            test_planning_messages(&["alice".to_string()], &[]),
             &["alice".to_string()],
             0.0,
         )
@@ -1989,7 +2011,7 @@ mod tests {
             &http_client,
             &config,
             &graph,
-            test_planning_messages(&["alice".to_string()]),
+            test_planning_messages(&["alice".to_string()], &[]),
             &["alice".to_string()],
             0.0,
         )
@@ -2006,7 +2028,7 @@ mod tests {
             &http_client,
             &config,
             &graph,
-            test_planning_messages(&["alice".to_string()]),
+            test_planning_messages(&["alice".to_string()], &[]),
             &["alice".to_string()],
             0.0,
         )
@@ -2023,7 +2045,7 @@ mod tests {
             &http_client,
             &config,
             &graph,
-            test_planning_messages(&["alice".to_string()]),
+            test_planning_messages(&["alice".to_string()], &[]),
             &["alice".to_string()],
             0.0,
         )
@@ -2055,7 +2077,7 @@ mod tests {
             &http_client,
             &config,
             &graph,
-            test_planning_messages(&["alice".to_string()]),
+            test_planning_messages(&["alice".to_string()], &[]),
             &["alice".to_string()],
             0.0,
         )
@@ -2084,7 +2106,7 @@ mod tests {
             &http_client,
             &config,
             &graph,
-            test_planning_messages(&["alice".to_string()]),
+            test_planning_messages(&["alice".to_string()], &[]),
             &["alice".to_string()],
             0.0,
         )
@@ -2102,7 +2124,7 @@ mod tests {
             &http_client,
             &config,
             &graph,
-            test_planning_messages(&["alice".to_string()]),
+            test_planning_messages(&["alice".to_string()], &[]),
             &["alice".to_string()],
             0.0,
         )
@@ -2120,7 +2142,7 @@ mod tests {
             &http_client,
             &config,
             &graph,
-            test_planning_messages(&["alice".to_string()]),
+            test_planning_messages(&["alice".to_string()], &[]),
             &["alice".to_string()],
             0.0,
         )
@@ -2137,7 +2159,7 @@ mod tests {
             &http_client,
             &config,
             &graph,
-            test_planning_messages(&["alice".to_string()]),
+            test_planning_messages(&["alice".to_string()], &[]),
             &["alice".to_string()],
             0.0,
         )
@@ -2335,6 +2357,7 @@ mod tests {
             &["alice".to_string()],
             "alice".to_string(),
             "hello".to_string(),
+            &[],
         );
         assert_eq!(messages.len(), 2);
         assert!(messages[0]
@@ -2343,6 +2366,31 @@ mod tests {
             .unwrap_or_default()
             .contains("Allowed candidate users: alice"));
         assert_eq!(messages[1].get("role").and_then(|v| v.as_str()), Some("user"));
+    }
+
+    #[test]
+    fn build_tool_planning_messages_keeps_multimodal_attachments() {
+        let bundle = test_prompt_bundle();
+        let attachment = kernel::event::ImageAttachment {
+            mime_type: "image/png".to_string(),
+            filename: Some("photo.png".to_string()),
+            source_url: None,
+            data_base64: base64::prelude::BASE64_STANDARD.encode(b"png-data"),
+        };
+        let messages = build_tool_planning_messages(
+            &bundle,
+            &["alice".to_string()],
+            "alice".to_string(),
+            "describe this".to_string(),
+            &[attachment],
+        );
+
+        let content = messages[1]
+            .get("content")
+            .and_then(|value| value.as_array())
+            .expect("planning multimodal content array");
+        assert_eq!(content[0].get("type").and_then(|value| value.as_str()), Some("text"));
+        assert_eq!(content[1].get("type").and_then(|value| value.as_str()), Some("image_url"));
     }
 
     #[test]

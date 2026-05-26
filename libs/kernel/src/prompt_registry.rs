@@ -101,6 +101,13 @@ pub fn render_prompt_or(id: &str, vars: &[(&str, &str)], fallback: &str) -> Stri
     apply_vars(&content, vars)
 }
 
+pub fn registered_prompt_ids() -> Result<Vec<String>> {
+    let registry = registry()?;
+    let mut ids: Vec<String> = registry.prompts.keys().cloned().collect();
+    ids.sort();
+    Ok(ids)
+}
+
 pub fn set_prompt_content(id: &str, content: String) -> Result<()> {
     let registry = registry()?;
     registry.set_prompt(id, content)

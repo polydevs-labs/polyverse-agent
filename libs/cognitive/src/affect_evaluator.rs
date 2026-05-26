@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Instant;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use kernel::get_agent_profile;
 use kernel::event::Event;
@@ -161,6 +161,33 @@ pub struct AffectEvaluatorWorker {
 }
 
 impl AffectEvaluatorWorker {
+    pub async fn validate_api_connection(config: &AffectEvaluatorConfig) -> Result<()> {
+        let timeout_secs = config.api_timeout_secs.unwrap_or(15);
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+
+        let url = format!("{}/models", config.api_base.trim_end_matches('/'));
+        let response = http_client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .send()
+            .await
+            .context("Failed to connect to affect evaluator API")?;
+
+        if response.status().is_success() {
+            info!(api_base = %config.api_base, model = %config.model, "Affect evaluator API connection validated");
+            Ok(())
+        } else if response.status().as_u16() == 401 || response.status().as_u16() == 403 {
+            Err(anyhow::anyhow!("Affect evaluator API authentication failed — check your API key"))
+        } else {
+            warn!(status = %response.status(), api_base = %config.api_base, "Affect evaluator API /models endpoint returned error (API may still work for chat)");
+            Ok(())
+        }
+    }
+
     fn log_latency_summary(
         config: &AffectEvaluatorConfig,
         message_id: &str,
@@ -251,9 +278,13 @@ impl Worker for AffectEvaluatorWorker {
         }
 
         self.status = WorkerStatus::Healthy;
-        
-        let mut broadcast_rx = ctx.subscribe_events();
-        let mut shutdown_rx = ctx.subscribe_shutdown();
+        let _ = ctx
+            .emit(Event::System(kernel::event::SystemEvent::WorkerReady {
+                name: self.name().to_string(),
+            }))
+            .await;
+
+        let mut broadcast_rx = ctx.subscribe_events();        let mut shutdown_rx = ctx.subscribe_shutdown();
         
         let http_client = self.http_client.clone();
         let config = self.config.clone();
