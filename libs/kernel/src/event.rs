@@ -129,6 +129,7 @@ pub struct BiologyEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SystemEvent {
     WorkerStarted { name: String },
+    WorkerReady { name: String },
     WorkerStopped { name: String },
     WorkerError { name: String, error: String },
     ShutdownRequested,

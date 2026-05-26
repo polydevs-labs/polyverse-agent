@@ -5,7 +5,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use memory::graph::CognitiveGraph;
 use mcp::{
-    build_mcp_router, registry::ToolRegistry, WebFetchProviderConfig, WebFetchToolProvider,
+    build_mcp_router, registry::ToolRegistry, SearchProviderConfig, WebFetchProviderConfig,
+    WebFetchToolProvider, WebRetrieveFastProviderConfig, WebRetrieveFastToolProvider,
 };
 use serde_json::{json, Value};
 use tower::util::ServiceExt;
@@ -67,6 +68,271 @@ fn web_fetch_registry() -> ToolRegistry {
         max_redirects: 3,
         max_key_links: 8,
     }))])
+}
+
+fn web_retrieve_fast_registry(enabled: bool) -> ToolRegistry {
+    let search_config = SearchProviderConfig {
+        enabled,
+        api_key: if enabled {
+            Some("test-key".to_string())
+        } else {
+            None
+        },
+        timeout_ms: 2_000,
+        max_results: 5,
+        brave_api_base: "https://example.invalid/search".to_string(),
+    };
+
+    ToolRegistry::new(vec![Arc::new(WebRetrieveFastToolProvider::new(
+        WebRetrieveFastProviderConfig {
+            enabled,
+            total_budget_ms: 1_200,
+            search_timeout_ms: 600,
+            fetch_timeout_ms: 400,
+            fetch_k_default: 2,
+            max_chars_per_page_default: 1_200,
+            cache_ttl_ms: 30_000,
+            cache_max_entries: 128,
+        },
+        search_config,
+    ))])
+}
+
+async fn web_retrieve_fast_app_with_stub_executor() -> axum::Router {
+    let graph = CognitiveGraph::new("memory")
+        .await
+        .expect("in-memory graph should initialize");
+
+    mcp::build_mcp_router_for_tests(
+        Arc::new(web_retrieve_fast_registry(true)),
+        graph,
+        2000,
+        |name, input, _graph| async move {
+            if name != "web.retrieve_fast" {
+                return Err(anyhow!("unknown MCP tool: {name}"));
+            }
+
+            let query = input
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+
+            Ok(json!({
+                "query": query,
+                "results": [],
+                "evidence": [],
+                "citations": [],
+                "meta": {
+                    "source": "web_retrieve_fast",
+                    "response_ms": 0,
+                    "search_ms": 0,
+                    "fetch_ms": 0,
+                    "partial": false,
+                    "degraded_reason": null,
+                    "cache_hit": false,
+                    "budget_ms": 1200,
+                    "fetch_attempted": 0,
+                    "fetch_succeeded": 0
+                }
+            }))
+        },
+    )
+}
+
+async fn web_retrieve_fast_app() -> axum::Router {
+    let graph = CognitiveGraph::new("memory")
+        .await
+        .expect("in-memory graph should initialize");
+    build_mcp_router(Arc::new(web_retrieve_fast_registry(true)), graph, 2000)
+}
+
+async fn web_retrieve_fast_app_disabled() -> axum::Router {
+    let graph = CognitiveGraph::new("memory")
+        .await
+        .expect("in-memory graph should initialize");
+    build_mcp_router(Arc::new(web_retrieve_fast_registry(false)), graph, 2000)
+}
+
+async fn web_retrieve_fast_timeout_app() -> axum::Router {
+    let graph = CognitiveGraph::new("memory")
+        .await
+        .expect("in-memory graph should initialize");
+
+    mcp::build_mcp_router_for_tests(
+        Arc::new(web_retrieve_fast_registry(true)),
+        graph,
+        1,
+        |_name, _input, _graph| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Ok(json!({"ok": true}))
+        },
+    )
+}
+
+async fn assert_web_retrieve_fast_success_shape(app: axum::Router) {
+    let response = app
+        .oneshot(tool_call_request(json!({
+            "name": "web.retrieve_fast",
+            "input": { "query": "rust" }
+        })))
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = read_json(response).await;
+    assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+    let result = payload.get("result").expect("result should exist");
+    assert_eq!(result.get("query").and_then(|v| v.as_str()), Some("rust"));
+    assert!(result.get("results").and_then(|v| v.as_array()).is_some());
+    assert!(result.get("evidence").and_then(|v| v.as_array()).is_some());
+    assert!(result.get("citations").and_then(|v| v.as_array()).is_some());
+
+    let meta = result.get("meta").expect("meta should exist");
+    for key in [
+        "source",
+        "response_ms",
+        "search_ms",
+        "fetch_ms",
+        "partial",
+        "degraded_reason",
+        "cache_hit",
+        "budget_ms",
+        "fetch_attempted",
+        "fetch_succeeded",
+    ] {
+        assert!(meta.get(key).is_some(), "meta missing {key}");
+    }
+}
+
+async fn assert_web_retrieve_fast_validation_errors(app: axum::Router) {
+    assert_bad_request_contains(
+        app.clone(),
+        json!({
+            "name": "web.retrieve_fast",
+            "input": {}
+        }),
+        "missing field `query`",
+    )
+    .await;
+
+    assert_bad_request_contains(
+        app.clone(),
+        json!({
+            "name": "web.retrieve_fast",
+            "input": { "query": "   " }
+        }),
+        "query is required",
+    )
+    .await;
+
+    assert_bad_request_contains(
+        app.clone(),
+        json!({
+            "name": "web.retrieve_fast",
+            "input": { "query": "rust", "safesearch": "invalid" }
+        }),
+        "safesearch must be one of: off, moderate, strict",
+    )
+    .await;
+
+    assert_bad_request_contains(
+        app.clone(),
+        json!({
+            "name": "web.retrieve_fast",
+            "input": { "query": "rust", "unexpected": true }
+        }),
+        "unknown field `unexpected`",
+    )
+    .await;
+
+    assert_bad_request_contains(
+        app,
+        json!({
+            "name": "web.retrieve_fast",
+            "input": "oops"
+        }),
+        "invalid type: expected a JSON object for input",
+    )
+    .await;
+}
+
+async fn assert_web_retrieve_fast_disabled_error(app: axum::Router) {
+    let response = app
+        .oneshot(tool_call_request(json!({
+            "name": "web.retrieve_fast",
+            "input": { "query": "rust" }
+        })))
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload = read_json(response).await;
+    assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(false));
+    assert!(payload
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .contains("unknown MCP tool"));
+}
+
+async fn assert_web_retrieve_fast_timeout_error(app: axum::Router) {
+    let response = app
+        .oneshot(tool_call_request(json!({
+            "name": "web.retrieve_fast",
+            "input": { "query": "rust" }
+        })))
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    let payload = read_json(response).await;
+    assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(
+        payload.get("error").and_then(|v| v.as_str()),
+        Some("tool call timeout")
+    );
+}
+
+#[tokio::test]
+async fn tools_endpoint_lists_web_retrieve_fast_when_enabled() {
+    let app = web_retrieve_fast_app_with_stub_executor().await;
+
+    let response = app
+        .oneshot(tools_list_request())
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = read_json(response).await;
+    let arr = payload.as_array().expect("tools payload should be array");
+    assert_eq!(arr.len(), 1);
+
+    let tool = &arr[0];
+    assert_eq!(tool.get("name").and_then(|v| v.as_str()), Some("web.retrieve_fast"));
+    assert_eq!(tool.get("read_only").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(tool.get("namespace").and_then(|v| v.as_str()), Some("read"));
+}
+
+#[tokio::test]
+async fn tools_call_endpoint_web_retrieve_fast_success_shape() {
+    let app = web_retrieve_fast_app_with_stub_executor().await;
+    assert_web_retrieve_fast_success_shape(app).await;
+}
+
+#[tokio::test]
+async fn tools_call_endpoint_web_retrieve_fast_validation_and_unknown_tool_errors() {
+    let app = web_retrieve_fast_app().await;
+    assert_web_retrieve_fast_validation_errors(app).await;
+
+    let disabled = web_retrieve_fast_app_disabled().await;
+    assert_web_retrieve_fast_disabled_error(disabled).await;
+}
+
+#[tokio::test]
+async fn tools_call_endpoint_web_retrieve_fast_timeout_shape() {
+    let app = web_retrieve_fast_timeout_app().await;
+    assert_web_retrieve_fast_timeout_error(app).await;
 }
 
 async fn web_fetch_app_with_stub_executor() -> axum::Router {

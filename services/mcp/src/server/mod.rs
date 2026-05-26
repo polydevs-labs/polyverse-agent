@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use axum::extract::{rejection::JsonRejection, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use kernel::event::Event;
 use kernel::worker::{Worker, WorkerContext, WorkerStatus};
 use memory::graph::CognitiveGraph;
 use serde::Serialize;
@@ -179,6 +180,11 @@ impl Worker for McpWorker {
                 );
 
                 self.status = WorkerStatus::Healthy;
+                let _ = ctx
+                    .emit(Event::System(kernel::event::SystemEvent::WorkerReady {
+                        name: self.name().to_string(),
+                    }))
+                    .await;
                 let mut shutdown_rx = ctx.subscribe_shutdown();
                 let _ = shutdown_rx.recv().await;
                 let _ = server_shutdown_tx.send(());

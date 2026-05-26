@@ -144,6 +144,9 @@ impl Coordinator {
 
             Event::System(sys) => {
                 debug!(event = ?sys, "System event");
+                if let Err(e) = self.broadcast_tx.send(Event::System(sys.clone())) {
+                    warn!(error = %e, "No subscribers for system event broadcast");
+                }
             }
         }
     }

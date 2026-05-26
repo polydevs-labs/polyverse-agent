@@ -5,6 +5,7 @@ use mcp::{
     registry::{ToolNamespace, ToolRegistry},
     ExecutionToolProvider, RegisteredTool, SearchProviderConfig, SearchToolProvider,
     SocialToolProvider, ToolProvider, WebFetchProviderConfig, WebFetchToolProvider,
+    WebRetrieveFastProviderConfig, WebRetrieveFastToolProvider,
 };
 use serde_json::json;
 
@@ -89,6 +90,90 @@ fn assert_web_fetch_tool_schema(value: &serde_json::Value) {
         value.get("additionalProperties").and_then(|v| v.as_bool()),
         Some(false)
     );
+}
+
+fn assert_web_retrieve_fast_tool_schema(value: &serde_json::Value) {
+    assert_eq!(value.get("type").and_then(|v| v.as_str()), Some("object"));
+    assert_eq!(
+        value
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+        Some(vec!["query"])
+    );
+    assert_eq!(
+        value.get("additionalProperties").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+}
+
+fn assert_no_web_retrieve_fast_tool(registry: &ToolRegistry) {
+    assert!(
+        registry
+            .list()
+            .iter()
+            .all(|tool| tool.name != "web.retrieve_fast")
+    );
+}
+
+fn assert_web_retrieve_fast_tool_registered(registry: &ToolRegistry) {
+    let tool = registry
+        .get_registered("web.retrieve_fast")
+        .expect("web.retrieve_fast should be registered");
+    assert_eq!(tool.descriptor.namespace, ToolNamespace::Read);
+    assert!(tool.descriptor.read_only);
+    assert_web_retrieve_fast_tool_schema(&tool.input_schema);
+}
+
+fn registry_with_web_retrieve_fast(enabled: bool) -> ToolRegistry {
+    let search_config = SearchProviderConfig {
+        enabled,
+        api_key: if enabled {
+            Some("test-key".to_string())
+        } else {
+            None
+        },
+        timeout_ms: 2_000,
+        max_results: 5,
+        brave_api_base: "https://example.invalid/search".to_string(),
+    };
+
+    let fast_provider = WebRetrieveFastToolProvider::new(
+        WebRetrieveFastProviderConfig {
+            enabled,
+            total_budget_ms: 1_200,
+            search_timeout_ms: 600,
+            fetch_timeout_ms: 400,
+            fetch_k_default: 2,
+            max_chars_per_page_default: 1_200,
+            cache_ttl_ms: 30_000,
+            cache_max_entries: 128,
+        },
+        search_config,
+    );
+
+    ToolRegistry::new(vec![
+        Arc::new(SocialToolProvider::default()),
+        Arc::new(fast_provider),
+    ])
+}
+
+fn assert_no_web_fetch_tool(registry: &ToolRegistry) {
+    assert!(
+        registry
+            .list()
+            .iter()
+            .all(|tool| !tool.name.starts_with("web."))
+    );
+}
+
+fn assert_web_fetch_tool_registered(registry: &ToolRegistry) {
+    let tool = registry
+        .get_registered("web.fetch")
+        .expect("web.fetch should be registered");
+    assert_eq!(tool.descriptor.namespace, ToolNamespace::Read);
+    assert!(tool.descriptor.read_only);
+    assert_web_fetch_tool_schema(&tool.input_schema);
 }
 
 fn approx_eq(left: f64, right: f64) {
@@ -208,24 +293,6 @@ fn assert_search_tool_registered(registry: &ToolRegistry) {
     assert_eq!(tool.descriptor.namespace, ToolNamespace::Read);
     assert!(tool.descriptor.read_only);
     assert_search_tool_schema(&tool.input_schema);
-}
-
-fn assert_no_web_fetch_tool(registry: &ToolRegistry) {
-    assert!(
-        registry
-            .list()
-            .iter()
-            .all(|tool| !tool.name.starts_with("web."))
-    );
-}
-
-fn assert_web_fetch_tool_registered(registry: &ToolRegistry) {
-    let tool = registry
-        .get_registered("web.fetch")
-        .expect("web.fetch should be registered");
-    assert_eq!(tool.descriptor.namespace, ToolNamespace::Read);
-    assert!(tool.descriptor.read_only);
-    assert_web_fetch_tool_schema(&tool.input_schema);
 }
 
 fn assert_tool_descriptor_shape(tool: &RegisteredTool) {
@@ -706,4 +773,126 @@ async fn enabled_web_fetch_provider_rejects_ipv6_doc_range_without_network() {
         .await;
     let err = result.expect_err("ipv6 documentation range should fail");
     assert!(err.to_string().contains("url host is not allowed"));
+}
+
+#[tokio::test]
+async fn default_registry_does_not_expose_web_retrieve_fast_tool() {
+    let registry = ToolRegistry::default();
+    assert_no_web_retrieve_fast_tool(&registry);
+    assert!(registry.get_registered("web.retrieve_fast").is_none());
+}
+
+#[tokio::test]
+async fn enabled_web_retrieve_fast_provider_registers_read_tool_with_schema() {
+    let registry = registry_with_web_retrieve_fast(true);
+    assert_web_retrieve_fast_tool_registered(&registry);
+}
+
+#[tokio::test]
+async fn disabled_web_retrieve_fast_provider_does_not_register_tool() {
+    let graph = CognitiveGraph::new("memory")
+        .await
+        .expect("in-memory graph should initialize");
+    let registry = registry_with_web_retrieve_fast(false);
+
+    assert_no_web_retrieve_fast_tool(&registry);
+    let result = registry
+        .execute("web.retrieve_fast", json!({ "query": "rust" }), &graph)
+        .await;
+    let err = result.expect_err("disabled web.retrieve_fast should not execute");
+    assert!(
+        err.to_string().contains("unknown MCP tool")
+            || err
+                .to_string()
+                .contains("web retrieve fast tools are disabled")
+    );
+}
+
+#[tokio::test]
+async fn enabled_web_retrieve_fast_provider_rejects_empty_query_without_network() {
+    let graph = CognitiveGraph::new("memory")
+        .await
+        .expect("in-memory graph should initialize");
+    let registry = registry_with_web_retrieve_fast(true);
+
+    let result = registry
+        .execute("web.retrieve_fast", json!({ "query": "   " }), &graph)
+        .await;
+    let err = result.expect_err("empty query should fail");
+    assert!(err.to_string().contains("query is required"));
+}
+
+#[tokio::test]
+async fn enabled_web_retrieve_fast_provider_rejects_invalid_safesearch_without_network() {
+    let graph = CognitiveGraph::new("memory")
+        .await
+        .expect("in-memory graph should initialize");
+    let registry = registry_with_web_retrieve_fast(true);
+
+    let result = registry
+        .execute(
+            "web.retrieve_fast",
+            json!({ "query": "rust", "safesearch": "invalid" }),
+            &graph,
+        )
+        .await;
+    let err = result.expect_err("invalid safesearch should fail");
+    assert!(
+        err.to_string()
+            .contains("safesearch must be one of: off, moderate, strict")
+    );
+}
+
+#[tokio::test]
+async fn enabled_web_retrieve_fast_provider_rejects_unknown_fields_without_network() {
+    let graph = CognitiveGraph::new("memory")
+        .await
+        .expect("in-memory graph should initialize");
+    let registry = registry_with_web_retrieve_fast(true);
+
+    let result = registry
+        .execute(
+            "web.retrieve_fast",
+            json!({ "query": "rust", "unexpected": true }),
+            &graph,
+        )
+        .await;
+    let err = result.expect_err("unknown field should fail");
+    assert!(err.to_string().contains("unknown field `unexpected`"));
+}
+
+#[tokio::test]
+async fn enabled_web_retrieve_fast_provider_rejects_invalid_fetch_k_without_network() {
+    let graph = CognitiveGraph::new("memory")
+        .await
+        .expect("in-memory graph should initialize");
+    let registry = registry_with_web_retrieve_fast(true);
+
+    let result = registry
+        .execute(
+            "web.retrieve_fast",
+            json!({ "query": "rust", "fetch_k": "oops" }),
+            &graph,
+        )
+        .await;
+    let err = result.expect_err("invalid fetch_k type should fail");
+    assert!(err.to_string().contains("invalid type"));
+}
+
+#[tokio::test]
+async fn enabled_web_retrieve_fast_provider_rejects_invalid_max_chars_per_page_without_network() {
+    let graph = CognitiveGraph::new("memory")
+        .await
+        .expect("in-memory graph should initialize");
+    let registry = registry_with_web_retrieve_fast(true);
+
+    let result = registry
+        .execute(
+            "web.retrieve_fast",
+            json!({ "query": "rust", "max_chars_per_page": "oops" }),
+            &graph,
+        )
+        .await;
+    let err = result.expect_err("invalid max_chars_per_page type should fail");
+    assert!(err.to_string().contains("invalid type"));
 }

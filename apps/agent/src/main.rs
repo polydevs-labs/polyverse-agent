@@ -1,8 +1,9 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kernel::get_agent_profile;
+use kernel::prompt_registry;
 use serde::Deserialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -29,6 +30,34 @@ struct SettingsJson {
     dialogue_tool_max_candidate_users: Option<usize>,
     #[serde(default)]
     api_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StatePromptFileConfig {
+    #[serde(default)]
+    snapshot: Option<StatePromptSnapshotFileConfig>,
+    #[serde(default)]
+    legend: Option<StatePromptLegendFileConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StatePromptSnapshotFileConfig {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    precision: Option<usize>,
+    #[serde(default)]
+    include_derived: Option<bool>,
+    #[serde(default)]
+    domains: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StatePromptLegendFileConfig {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
 fn parse_truthy(value: &str) -> bool {
@@ -272,6 +301,137 @@ fn load_mcp_config() -> McpConfig {
     config
 }
 
+fn build_dialogue_engine_config(settings: &SettingsJson, config: &Config) -> DialogueEngineConfig {
+    DialogueEngineConfig {
+        api_base: config.dialogue_engine.api_base.clone(),
+        api_key: config.dialogue_engine.api_key.clone(),
+        model: config.dialogue_engine.model.clone(),
+        chat_max_tokens: resolve_chat_max_tokens(settings),
+        reasoning: config.dialogue_engine.reasoning.clone(),
+        tool_calling: resolve_dialogue_tool_calling(settings),
+        api_timeout_secs: settings.api_timeout_secs,
+    }
+}
+
+fn build_affect_evaluator_config(settings: &SettingsJson) -> AffectEvaluatorConfig {
+    AffectEvaluatorConfig {
+        api_base: std::env::var("AFFECT_EVALUATOR_API_BASE")
+            .or_else(|_| std::env::var("OPENAI_API_BASE"))
+            .or_else(|_| std::env::var("API_BASE"))
+            .unwrap_or_default(),
+        api_key: std::env::var("AFFECT_EVALUATOR_API_KEY")
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            .or_else(|_| std::env::var("API_KEY"))
+            .unwrap_or_default(),
+        model: std::env::var("AFFECT_EVALUATOR_MODEL")
+            .or_else(|_| std::env::var("OPENAI_MODEL"))
+            .or_else(|_| std::env::var("MODEL"))
+            .unwrap_or_default(),
+        reasoning: std::env::var("AFFECT_EVALUATOR_REASONING")
+            .or_else(|_| std::env::var("OPENAI_REASONING"))
+            .or_else(|_| std::env::var("REASONING"))
+            .ok(),
+        api_timeout_secs: settings.api_timeout_secs,
+    }
+}
+
+fn required_prompt_ids() -> [&'static str; 5] {
+    [
+        "persona.base",
+        "dialogue_engine.fallback",
+        "affect_evaluator.base_instruction",
+        "affect_evaluator.composite_header",
+        "affect_evaluator.user_extract",
+    ]
+}
+
+async fn preflight_core_checks(settings: &SettingsJson, config: &Config, agent_profile: &kernel::AgentProfile) -> Result<()> {
+    let mut issues = Vec::new();
+
+    if let Err(err) = prompt_registry::registered_prompt_ids().context("prompt registry failed to load") {
+        issues.push(format!("prompt registry: {err:#}"));
+    } else {
+        for id in required_prompt_ids() {
+            if let Err(err) = prompt_registry::get_prompt(id) {
+                issues.push(format!("prompt {id}: {err:#}"));
+            }
+        }
+    }
+
+    if let Ok(raw) = std::fs::read_to_string(SETTINGS_JSON_PATH) {
+        if let Err(err) = serde_json::from_str::<SettingsJson>(&raw) {
+            issues.push(format!("settings.json: failed to parse {SETTINGS_JSON_PATH}: {err}"));
+        }
+    }
+
+    let state_prompt_path = std::env::var("STATE_PROMPT_CONFIG_PATH")
+        .unwrap_or_else(|_| "config/state_prompt.json".to_string());
+    match std::fs::read_to_string(&state_prompt_path) {
+        Ok(raw) => match serde_json::from_str::<StatePromptFileConfig>(&raw) {
+            Ok(file) => {
+                if let Some(snapshot) = file.snapshot {
+                    if let Some(enabled) = snapshot.enabled {
+                        let _ = enabled;
+                    }
+                    if let Some(precision) = snapshot.precision {
+                        if precision > 6 {
+                            issues.push(format!("state prompt config: precision out of range in {state_prompt_path}"));
+                        }
+                    }
+                    if let Some(include_derived) = snapshot.include_derived {
+                        let _ = include_derived;
+                    }
+                    if let Some(domains) = snapshot.domains {
+                        if domains.iter().any(|domain| domain.trim().is_empty()) {
+                            issues.push(format!("state prompt config: empty domain found in {state_prompt_path}"));
+                        }
+                    }
+                }
+                if let Some(legend) = file.legend {
+                    let _ = legend.enabled;
+                    let _ = legend.prompt;
+                }
+            }
+            Err(err) => issues.push(format!("state prompt config: failed to parse {state_prompt_path}: {err}")),
+        },
+        Err(err) => issues.push(format!("state prompt config: failed to read {state_prompt_path}: {err}")),
+    }
+
+    let state_schema_path = std::env::var("STATE_SCHEMA_PATH")
+        .unwrap_or_else(|_| "config/state_schema.v0.json".to_string());
+    match StateStore::load_from_file(&state_schema_path) {
+        Ok(_) => {}
+        Err(err) => issues.push(format!("state schema: {err:#}")),
+    }
+
+    let dialogue_engine_config = build_dialogue_engine_config(settings, config);
+    if !dialogue_engine_config.is_valid() {
+        issues.push("dialogue engine: missing api_base/api_key/model or API key placeholder".to_string());
+    } else if let Err(err) = cognitive::dialogue_engine::DialogueEngineWorker::validate_api_connection(&dialogue_engine_config).await {
+        issues.push(format!("dialogue engine API: {err:#}"));
+    }
+
+    let affect_config = build_affect_evaluator_config(settings);
+    if !affect_config.is_valid() {
+        issues.push("affect evaluator: missing api_base/api_key/model".to_string());
+    } else if let Err(err) = cognitive::affect_evaluator::AffectEvaluatorWorker::validate_api_connection(&affect_config).await {
+        issues.push(format!("affect evaluator API: {err:#}"));
+    }
+
+    if agent_profile.agent_id.trim().is_empty() {
+        issues.push("agent profile: agent_id is empty".to_string());
+    }
+    if agent_profile.display_name.trim().is_empty() {
+        issues.push("agent profile: display_name is empty".to_string());
+    }
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("startup preflight failed:\n- {}", issues.join("\n- ")))
+    }
+}
+
 fn load_config() -> Result<Config> {
     match dotenvy::dotenv() {
         Ok(path) => info!(path = %path.display(), "Loaded .env file"),
@@ -357,6 +517,9 @@ async fn main() -> Result<()> {
         display_name = %agent_profile.display_name,
         "=== Polyverse Agent Starting ==="
     );
+
+    preflight_core_checks(&settings, &config, &agent_profile).await?;
+    info!("Startup preflight passed");
 
     let mut supervisor = Supervisor::new();
 
@@ -499,18 +662,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let chat_max_tokens = resolve_chat_max_tokens(&settings);
-    let dialogue_tool_calling = resolve_dialogue_tool_calling(&settings);
-
-    let dialogue_engine_config = DialogueEngineConfig {
-        api_base: config.dialogue_engine.api_base.clone(),
-        api_key: config.dialogue_engine.api_key.clone(),
-        model: config.dialogue_engine.model.clone(),
-        chat_max_tokens,
-        reasoning: config.dialogue_engine.reasoning.clone(),
-        tool_calling: dialogue_tool_calling,
-        api_timeout_secs: settings.api_timeout_secs,
-    };
+    let dialogue_engine_config = build_dialogue_engine_config(&settings, &config);
 
     if dialogue_engine_config.is_valid() {
         info!(
@@ -538,48 +690,25 @@ async fn main() -> Result<()> {
         );
     }
 
-    if let (Ok(base), Ok(key), Ok(model)) = (
-        std::env::var("AFFECT_EVALUATOR_API_BASE")
-            .or_else(|_| std::env::var("OPENAI_API_BASE"))
-            .or_else(|_| std::env::var("API_BASE")),
-        std::env::var("AFFECT_EVALUATOR_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .or_else(|_| std::env::var("API_KEY")),
-        std::env::var("AFFECT_EVALUATOR_MODEL")
-            .or_else(|_| std::env::var("OPENAI_MODEL"))
-            .or_else(|_| std::env::var("MODEL"))
-    ) {
-        let reasoning = std::env::var("AFFECT_EVALUATOR_REASONING")
-            .or_else(|_| std::env::var("OPENAI_REASONING"))
-            .or_else(|_| std::env::var("REASONING"))
-            .ok();
-
-        let affect_evaluator_config = AffectEvaluatorConfig {
-            api_base: base,
-            api_key: key,
-            model,
-            reasoning,
-            api_timeout_secs: settings.api_timeout_secs,
-        };
-        if affect_evaluator_config.is_valid() {
-            info!(
-                api_base = %affect_evaluator_config.api_base,
-                model = %affect_evaluator_config.model,
-                "Registering Affect Evaluator JSON worker"
-            );
-            let mut affect_worker = AffectEvaluatorWorker::new(
-                affect_evaluator_config,
-                cognitive_graph.clone(),
-                Arc::clone(&short_term_handle),
-                Some(Arc::clone(&episodic)),
-                Some(Arc::clone(&embedder)),
-            );
-            if let Some(store) = state_store_for_affect {
-                affect_worker = affect_worker.with_state_store(store);
-            }
-            supervisor.register(affect_worker);
-            worker_count += 1;
+    let affect_evaluator_config = build_affect_evaluator_config(&settings);
+    if affect_evaluator_config.is_valid() {
+        info!(
+            api_base = %affect_evaluator_config.api_base,
+            model = %affect_evaluator_config.model,
+            "Registering Affect Evaluator JSON worker"
+        );
+        let mut affect_worker = AffectEvaluatorWorker::new(
+            affect_evaluator_config,
+            cognitive_graph.clone(),
+            Arc::clone(&short_term_handle),
+            Some(Arc::clone(&episodic)),
+            Some(Arc::clone(&embedder)),
+        );
+        if let Some(store) = state_store_for_affect {
+            affect_worker = affect_worker.with_state_store(store);
         }
+        supervisor.register(affect_worker);
+        worker_count += 1;
     } else {
         warn!(
             "Affect evaluator not configured (set AFFECT_EVALUATOR_API_BASE, AFFECT_EVALUATOR_API_KEY, AFFECT_EVALUATOR_MODEL in .env)"
@@ -607,6 +736,9 @@ async fn main() -> Result<()> {
     });
 
     supervisor.start_all().await?;
+    supervisor
+        .wait_for_ready(std::time::Duration::from_secs(30))
+        .await?;
 
     info!(
         workers = worker_count,
@@ -682,6 +814,79 @@ mod tests {
 
     fn remove_env<K: AsRef<OsStr>>(key: K) {
         unsafe { std::env::remove_var(key) }
+    }
+
+    #[test]
+    fn required_prompt_ids_include_core_prompts() {
+        let ids = required_prompt_ids();
+        assert!(ids.contains(&"persona.base"));
+        assert!(ids.contains(&"dialogue_engine.fallback"));
+        assert!(ids.contains(&"affect_evaluator.base_instruction"));
+        assert!(ids.contains(&"affect_evaluator.composite_header"));
+        assert!(ids.contains(&"affect_evaluator.user_extract"));
+        assert!(!ids.contains(&"context.state.legend"));
+    }
+
+    #[test]
+    fn build_dialogue_engine_config_uses_settings_and_file_values() {
+        let _guard = env_guard();
+        remove_env("CHAT_MAX_TOKENS");
+
+        let settings = SettingsJson {
+            chat_max_tokens: Some(777),
+            api_timeout_secs: Some(33),
+            dialogue_tool_calling_enabled: Some(true),
+            dialogue_tool_max_calls_per_turn: Some(0),
+            dialogue_tool_timeout_ms: Some(50),
+            dialogue_tool_max_candidate_users: Some(0),
+            ..Default::default()
+        };
+        let config = Config {
+            agent: AgentConfig::default(),
+            dialogue_engine: DialogueEngineFileConfig {
+                api_base: "http://base".to_string(),
+                api_key: "key".to_string(),
+                model: "model".to_string(),
+                reasoning: Some("effort".to_string()),
+            },
+        };
+
+        let built = build_dialogue_engine_config(&settings, &config);
+        assert_eq!(built.api_base, "http://base");
+        assert_eq!(built.api_key, "key");
+        assert_eq!(built.model, "model");
+        assert_eq!(built.chat_max_tokens, 777);
+        assert_eq!(built.reasoning.as_deref(), Some("effort"));
+        assert_eq!(built.api_timeout_secs, Some(33));
+        assert!(built.tool_calling.enabled);
+        assert_eq!(built.tool_calling.max_calls_per_turn, 1);
+        assert_eq!(built.tool_calling.timeout_ms, 100);
+        assert_eq!(built.tool_calling.max_candidate_users, 1);
+    }
+
+    #[test]
+    fn build_affect_evaluator_config_uses_env_overrides() {
+        let _guard = env_guard();
+        set_env("AFFECT_EVALUATOR_API_BASE", "http://affect");
+        set_env("AFFECT_EVALUATOR_API_KEY", "affect-key");
+        set_env("AFFECT_EVALUATOR_MODEL", "affect-model");
+        set_env("AFFECT_EVALUATOR_REASONING", "high");
+
+        let settings = SettingsJson {
+            api_timeout_secs: Some(21),
+            ..Default::default()
+        };
+        let built = build_affect_evaluator_config(&settings);
+        assert_eq!(built.api_base, "http://affect");
+        assert_eq!(built.api_key, "affect-key");
+        assert_eq!(built.model, "affect-model");
+        assert_eq!(built.reasoning.as_deref(), Some("high"));
+        assert_eq!(built.api_timeout_secs, Some(21));
+
+        remove_env("AFFECT_EVALUATOR_API_BASE");
+        remove_env("AFFECT_EVALUATOR_API_KEY");
+        remove_env("AFFECT_EVALUATOR_MODEL");
+        remove_env("AFFECT_EVALUATOR_REASONING");
     }
 
     #[test]

@@ -311,6 +311,11 @@ impl Worker for MemoryWorker {
         let mut flush_interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
 
         info!("Memory worker ready");
+        let _ = ctx
+            .emit(Event::System(kernel::event::SystemEvent::WorkerReady {
+                name: self.name().to_string(),
+            }))
+            .await;
 
         loop {
             tokio::select! {
