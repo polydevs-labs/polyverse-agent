@@ -13,6 +13,7 @@ The repository is organized by role rather than by language alone. Rust packages
 | Path | Role | Current contents |
 | --- | --- | --- |
 | `apps/` | runnable applications and user-facing entrypoints | `agent`, `wiki` |
+| `platforms/` | platform-specific runner binaries | `discord`, `discord-selfbot`, `telegram` |
 | `libs/` | reusable internal libraries | `kernel`, `runtime`, `sensory`, `cognitive`, `memory`, `state` |
 | `services/` | local service and transport boundaries | `mcp` |
 | `testing/` | shared test support and integration coverage | `test-support`, `integration-tests` |
@@ -32,18 +33,26 @@ The main Rust binary and composition root. It loads config, initializes storage,
 
 A filesystem-driven Next.js app that renders `docs/wiki` as the public technical wiki.
 
+### `platforms/discord`, `platforms/telegram`, `platforms/discord-selfbot`
+
+Standalone platform runners that live outside the core agent binary.
+
+- `discord` runs the official Discord bot service.
+- `telegram` runs the Telegram bot service.
+- `discord-selfbot` launches the Discord selfbot relay runner, which depends on the Node.js helper in its subdirectory.
+
 ## Current library packages
 
 - `libs/kernel` — shared contracts, events, worker traits, agent profile loading, prompt registry helpers
 - `libs/runtime` — `Supervisor`, `EventBus`, `Coordinator`
-- `libs/sensory` — Discord and Telegram platform adapters
+- `libs/sensory` — Discord and Telegram platform adapters plus the platform relay client/server
 - `libs/cognitive` — dialogue engine, affect evaluator, social query facade, dialogue tool registry
 - `libs/memory` — persistence, short-term memory, episodic memory, cognitive graph, social tree projection
 - `libs/state` — state schema/store and state-derived workers
 
 ## Current service packages
 
-- `services/mcp` — local read-only MCP transport and registry wrapper
+- `services/mcp` — local MCP transport and registry wrapper, with HTTP and stdio surfaces
 
 ## Current test packages
 

@@ -6,7 +6,9 @@ order: 31
 
 # Runtime Configuration
 
-The main runtime is configured in `apps/agent/src/main.rs`. This page explains the current layering model and the most important runtime knobs.
+The main runtime is configured in `apps/agent/src/main.rs`. This page explains the layering model and the knobs that matter during day-to-day operation.
+
+For the full environment-variable matrix, see [Configuration](../../reference/configuration.md).
 
 ## Configuration layering
 
@@ -14,7 +16,7 @@ At startup, the runtime resolves configuration in this order:
 
 1. `.env` via `dotenvy`
 2. `config.toml` or the file pointed to by `PA_CONFIG`
-3. environment overrides for platform tokens, agent identity, and model config
+3. environment overrides for platform tokens, MCP settings, agent identity, and model config
 4. `settings.json` for local non-API behavior such as logging and token limits
 
 This means the live runtime can differ from `config.toml` if environment variables or `settings.json` override specific values.
@@ -51,17 +53,26 @@ If the runtime writes data to an unexpected place, the agent profile is one of t
 
 ## Runtime service defaults
 
+### Platform relay
+
+The relay socket used by platform binaries defaults to `/tmp/polyverse-agent-relay.sock`.
+
+Override it with `PLATFORM_RELAY_SOCKET` if you need to run multiple agent instances side by side.
+
 ### MCP
 
 MCP is opt-in and is loaded through `load_mcp_config()`.
 
 Defaults when enabled:
 
+- `MCP_TRANSPORT=http`
 - `MCP_BIND=127.0.0.1:4790`
 - `MCP_REQUEST_TIMEOUT_MS=2000`
 - `MCP_MAX_TOOL_CALLS_PER_TURN=4`
 
 The runtime also clamps unsafe minimums for timeout and tool-call count.
+
+The HTTP transport is the compatibility path; `MCP_TRANSPORT=stdio` is the better fit for native MCP clients that want JSON-RPC over stdio.
 
 ### State runtime
 
@@ -107,3 +118,4 @@ Prompt documents are not hardcoded into workers. They are resolved through `conf
 - MCP is a local/internal surface by default, not a public deployment target.
 - The runtime creates missing storage directories for memory, graph, and episodic data based on the resolved agent profile.
 - If a runtime claim is unclear, `apps/agent/src/main.rs` is the best source of truth.
+
