@@ -7,9 +7,14 @@
 # Memory database
 /data/
 
-# IDE
+# IDE / local agent
+.claude/
 .idea/
 .vscode/
+
+# Cargo (keep checked-in workspace config)
+.cargo/
+!.cargo/config.toml
 *.swp
 *.swo
 

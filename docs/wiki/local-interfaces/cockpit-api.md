@@ -1,7 +1,7 @@
 ---
 title: Cockpit API (Removed)
 summary: Legacy cockpit interface removed from runtime.
-order: 31
+order: 33
 ---
 
 # Cockpit API (Removed)
